@@ -5,3 +5,5 @@ langgraph
 streamlit
 pydantic
 tenacity
+langchain-openai
+python-dotenv

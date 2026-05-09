@@ -76,15 +76,45 @@ def fetch_inventory(state: AgentState) -> Dict:
 
 # Node 3: Plan Drafter
 def draft_plan(state: AgentState) -> Dict:
+    from langchain_openai import ChatOpenAI
+    from langchain_core.prompts import ChatPromptTemplate
+
     inventory = state.get("inventory_data", [])
+    messages = list(state.get("messages", []))
+
+    # Extract the user's specific request
+    user_request = next((m.content for m in messages if isinstance(m, HumanMessage)), "")
 
     if not inventory:
         plan = "No inventory found to process."
     else:
-        total_quantity = sum(item.get("quantity", 0) for item in inventory)
-        plan = f"Plan: Reallocate {total_quantity} units across {len(inventory)} categories for optimal distribution."
+        # Instantiate ChatModel
+        llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
 
-    messages = list(state.get("messages", []))
+        # Construct dynamic system prompt
+        system_prompt = """You are an intelligent Supply Chain Orchestrator.
+Your goal is to draft a logistics reallocation plan based on the provided inventory data and the user's specific request.
+
+Inventory Data:
+{inventory_data}
+
+User Request:
+{user_request}
+
+Based on this, draft a specific, actionable, and logical reallocation plan. Only output the plan.
+"""
+        prompt = ChatPromptTemplate.from_template(system_prompt)
+        chain = prompt | llm
+
+        inventory_str = json.dumps(inventory, indent=2)
+
+        response = chain.invoke({
+            "inventory_data": inventory_str,
+            "user_request": user_request
+        })
+
+        plan = f"Plan: {response.content}"
+
     messages.append(AIMessage(content=f"Drafted Plan: {plan}"))
 
     log_task(state["request_id"], "DRAFTED", json.dumps({"plan": plan}))
@@ -101,6 +131,33 @@ def execute_plan(state: AgentState) -> Dict:
     messages.append(AIMessage(content="Plan executed successfully."))
     log_task(state["request_id"], "EXECUTED", "Plan executed.")
     return {"messages": messages, "status": "executed"}
+
+# Router for Intent
+def route_intent(state: AgentState):
+    messages = state.get("messages", [])
+    if not messages:
+        return "draft_plan"
+
+    # Get the user's initial message
+    user_message = next((m.content for m in messages if isinstance(m, HumanMessage)), "").lower()
+
+    # If the user intent is purely informational, end early.
+    # Otherwise, it's action-oriented (e.g. draft, plan, reallocate, optimize, etc.)
+    informational_keywords = ["show", "list", "what", "how many", "level", "stock", "inventory"]
+    action_keywords = ["draft", "plan", "reallocate", "optimize", "move", "ship", "send", "update"]
+
+    # Simple heuristic: if it contains action words, route to draft_plan
+    # If it contains informational words and no action words, route to end
+    has_action = any(word in user_message for word in action_keywords)
+    has_info = any(word in user_message for word in informational_keywords)
+
+    if has_action:
+        return "draft_plan"
+    elif has_info:
+        return "end"
+    else:
+        # Default to draft_plan if unclear but could be action
+        return "draft_plan"
 
 # Router for HITL
 def route_approval(state: AgentState):
@@ -121,7 +178,16 @@ builder.add_node("execute_plan", execute_plan)
 
 builder.set_entry_point("global_oracle")
 builder.add_edge("global_oracle", "fetch_inventory")
-builder.add_edge("fetch_inventory", "draft_plan")
+
+builder.add_conditional_edges(
+    "fetch_inventory",
+    route_intent,
+    {
+        "draft_plan": "draft_plan",
+        "end": END
+    }
+)
+
 builder.add_edge("draft_plan", "human_review")
 
 builder.add_conditional_edges(
