@@ -18,3 +18,19 @@ If you find yourself unable to import your repository due to the presence of fil
   4. Run `git add -A`
   5. Run `git commit`
   6. Run `git push`
+
+## Running Local Infrastructure (Sprint 2)
+To run the required PostgreSQL and Redis services locally for testing:
+
+```bash
+# Start Redis for Celery Broker/Backend
+docker run -d -p 6379:6379 --name local-redis redis:alpine
+
+# Start PostgreSQL for LangGraph Checkpointer
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres -e POSTGRES_DB=postgres --name local-postgres postgres:alpine
+```
+
+You can start the Celery worker process with:
+```bash
+celery -A worker worker --loglevel=info
+```
