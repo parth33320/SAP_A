@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+mock_sap.db
+dpo_training_data.json
+.env
