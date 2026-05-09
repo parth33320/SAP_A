@@ -7,3 +7,8 @@ pydantic
 tenacity
 langchain-openai
 python-dotenv
+langgraph-checkpoint-postgres
+redis
+celery
+psycopg-binary
+psycopg-pool

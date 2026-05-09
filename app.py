@@ -8,7 +8,9 @@ from guardrails import check_prompt_injection
 
 # Load environment variables
 load_dotenv()
-from graph import graph, log_dpo
+from graph import get_graph_with_postgres, log_dpo
+from worker import process_agent_task
+from celery.result import AsyncResult
 from generate_synthetic_load import generate_load
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -81,34 +83,54 @@ with col1:
                         "status": "init"
                     }
 
-                    # Run graph until HITL checkpoint
-                    for event in graph.stream(state, config):
-                        for k, v in event.items():
-                            if k == 'human_review':
-                                # Reached pause
-                                break
-
-                    # Get final state from checkpointer
-                    current_state = graph.get_state(config)
-                    final_messages = current_state.values.get("messages", [])
-                    drafted_plan = current_state.values.get("drafted_plan", "")
-
-                    for m in final_messages:
-                        if isinstance(m, AIMessage):
-                            # to avoid duplicating output in stream visually multiple times per message
-                            if not any(chat["content"] == m.content for chat in st.session_state.chat_history):
-                                st.write(m.content)
-                                st.session_state.chat_history.append({"role": "assistant", "content": m.content})
-
-                    st.session_state.pending_plan = drafted_plan
+                    # Dispatch task to Celery
+                    task = process_agent_task.delay(tenant_id, request_id, prompt)
+                    st.session_state.pending_task_id = task.id
+                    st.session_state.pending_request_id = request_id
                     st.session_state.pending_prompt = prompt
                     st.rerun()
+
+
+# Polling mechanism for Celery task
+if 'pending_task_id' in st.session_state:
+    task_id = st.session_state.pending_task_id
+    task = AsyncResult(task_id)
+
+    if task.state == 'PENDING' or task.state == 'STARTED':
+        with st.spinner("Processing via LangGraph Orchestrator..."):
+            time.sleep(2)
+            st.rerun()
+    elif task.state == 'SUCCESS' or task.status == 'PAUSED_FOR_REVIEW':
+        # Task finished or paused, we can read from Postgres
+        st.success("Execution completed or paused.")
+        graph = get_graph_with_postgres()
+        config = {"configurable": {"thread_id": st.session_state.pending_request_id}}
+        current_state = graph.get_state(config)
+
+        if current_state and hasattr(current_state, 'values'):
+            final_messages = current_state.values.get("messages", [])
+            drafted_plan = current_state.values.get("drafted_plan", "")
+
+            for m in final_messages:
+                if isinstance(m, AIMessage):
+                    if not any(chat["content"] == m.content for chat in st.session_state.chat_history):
+                        st.session_state.chat_history.append({"role": "assistant", "content": m.content})
+
+            st.session_state.pending_plan = drafted_plan
+
+        del st.session_state.pending_task_id
+        st.rerun()
+    elif task.state == 'FAILURE':
+        st.error(f"Task failed: {task.info}")
+        del st.session_state.pending_task_id
+        st.rerun()
 
 with col2:
     st.subheader("Controls")
 
     # Action Row: HITL
     st.write("Human-in-the-Loop Checkpoint")
+    graph = get_graph_with_postgres()
     current_state = graph.get_state(config)
 
     if current_state.next == ('human_review',):
