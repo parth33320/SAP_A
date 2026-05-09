@@ -3,7 +3,11 @@ import sqlite3
 import json
 import uuid
 import time
+from dotenv import load_dotenv
 from guardrails import check_prompt_injection
+
+# Load environment variables
+load_dotenv()
 from graph import graph, log_dpo
 from generate_synthetic_load import generate_load
 from langchain_core.messages import HumanMessage, AIMessage
