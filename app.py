@@ -135,6 +135,17 @@ with col2:
 
     if current_state.next == ('human_review',):
         st.warning("Execution Paused. Plan awaits approval.")
+
+        # --- Sprint-3 A2A visualisation ---
+        pending_po = current_state.values.get("pending_po")
+        if pending_po:
+            st.subheader("A2A Negotiation Transcript")
+            for exchange in current_state.values.get("a2a_transcript", []):
+                st.json(exchange)
+            st.subheader("Draft Purchase Order")
+            st.json(pending_po)
+        # -----------------------------------
+
         col_approve, col_reject = st.columns(2)
         with col_approve:
             if st.button("Approve", type="primary"):
