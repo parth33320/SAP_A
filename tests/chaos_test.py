@@ -10,7 +10,7 @@ logger = logging.getLogger("ChaosTest")
 # Add parent dir to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from graph import graph
+from graph import get_graph_with_postgres
 
 def run_chaos_test():
     # Enable chaos monkey
@@ -29,6 +29,7 @@ def run_chaos_test():
     logger.info("Starting graph with Chaos Monkey enabled. Expect retries.")
 
     try:
+        graph = get_graph_with_postgres()
         for event in graph.stream(state, config):
             for node_name, value in event.items():
                 if isinstance(value, dict) and "messages" in value:

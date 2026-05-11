@@ -4,7 +4,9 @@ import random
 from typing import Annotated, Any, Dict, List, Sequence, TypedDict
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+from psycopg_pool import ConnectionPool
+from langgraph.checkpoint.postgres import PostgresSaver
+import os
 import tenacity
 
 # Ensure task logging function
@@ -201,8 +203,24 @@ builder.add_conditional_edges(
 
 builder.add_edge("execute_plan", END)
 
-memory = MemorySaver()
-graph = builder.compile(
-    checkpointer=memory,
-    interrupt_before=["human_review"]
-)
+def get_graph():
+    return builder.compile(interrupt_before=["human_review"])
+
+def get_graph_with_postgres():
+    connection_kwargs = {
+        "autocommit": True,
+        "prepare_threshold": 0,
+    }
+
+    DB_URI = os.environ.get("POSTGRES_DB_URI", "postgresql://postgres:postgres@localhost:5432/postgres")
+    pool = ConnectionPool(conninfo=DB_URI, max_size=20, kwargs=connection_kwargs)
+    checkpointer = PostgresSaver(pool)
+    checkpointer.setup()
+
+    return builder.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["human_review"]
+    )
+
+if __name__ == "__main__":
+    graph = get_graph_with_postgres()
