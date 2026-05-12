@@ -4,7 +4,9 @@ import random
 from typing import Annotated, Any, Dict, List, Sequence, TypedDict
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+from psycopg_pool import ConnectionPool
+from langgraph.checkpoint.postgres import PostgresSaver
+import os
 import tenacity
 
 # Ensure task logging function
@@ -37,6 +39,9 @@ class AgentState(TypedDict):
     inventory_data: List[Dict[str, Any]]
     drafted_plan: str
     status: str
+    # Sprint-3 additions
+    a2a_transcript: List[Dict[str, Any]] # running negotiation log
+    pending_po: Dict[str, Any] # final Purchase Order
 
 # Node 1: Global Oracle (Prescriptive Analytics Stub)
 def global_oracle(state: AgentState) -> Dict:
@@ -132,31 +137,105 @@ def execute_plan(state: AgentState) -> Dict:
     log_task(state["request_id"], "EXECUTED", "Plan executed.")
     return {"messages": messages, "status": "executed"}
 
+import asyncio
+async def a2a_negotiate(state: AgentState) -> Dict:
+    """
+    Simulates an external Supplier-Agent handshake and returns a JSON quote.
+    The LLM call is wrapped with asyncio.to_thread() so we never block the
+    event loop.
+    """
+    from langchain_openai import ChatOpenAI
+    from langchain_core.prompts import ChatPromptTemplate
+
+    inventory      = state.get("inventory_data", [])
+    messages       = list(state.get("messages", []))
+    a2a_transcript = list(state.get("a2a_transcript", []))
+
+    # Identify SKUs that are stocked-out
+    stockouts = [item for item in inventory if item.get("quantity", 0) == 0]
+    if not stockouts:
+        return {}            # nothing to negotiate
+
+    # Build Supplier-Agent prompt
+    prompt_tmpl = ChatPromptTemplate.from_template("""
+You are a Supplier Agent. Provide a quote ONLY as valid JSON with the keys:
+"restock_quantity", "price_per_unit", "lead_time_days".
+SKUs needing restock:
+{stockouts}
+""")
+    llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+    chain = prompt_tmpl | llm
+    stockouts_str = json.dumps(stockouts, indent=2)
+
+    # Long-running external call – run in thread
+    quote_str = await asyncio.to_thread(
+        lambda: chain.invoke({"stockouts": stockouts_str}).content
+    )
+
+    try:
+        quote_json = json.loads(quote_str)
+    except Exception:
+        quote_json = {}
+
+    # Record the exchange
+    a2a_transcript.append({
+        "role":      "supplier_agent",
+        "request":   stockouts,
+        "response":  quote_json
+    })
+    messages.append(AIMessage(content=f"Supplier Agent quote received: {quote_json}"))
+    return {"a2a_transcript": a2a_transcript, "messages": messages}
+
+def draft_po(state: AgentState) -> Dict:
+    """
+    Converts the Supplier quote into a formal PO dictionary and stores it.
+    """
+    import random
+    a2a_transcript = state.get("a2a_transcript", [])
+    if not a2a_transcript:
+        return {}
+
+    latest = a2a_transcript[-1]
+    quote  = latest.get("response", {})
+    po = {
+        "po_id":           f"PO-{random.randint(100000, 999999)}",
+        "items":           latest.get("request", []),
+        "restock_quantity": quote.get("restock_quantity"),
+        "price_per_unit":   quote.get("price_per_unit"),
+        "lead_time_days":   quote.get("lead_time_days"),
+        "supplier":         "External Supplier Agent"
+    }
+
+    messages = list(state.get("messages", []))
+    messages.append(AIMessage(content=f"Drafted Purchase Order: {json.dumps(po)}"))
+    return {"pending_po": po, "messages": messages, "status": "drafted"}
+
 # Router for Intent
 def route_intent(state: AgentState):
-    messages = state.get("messages", [])
-    if not messages:
-        return "draft_plan"
+    """
+    Decide next hop after fetch_inventory.
 
-    # Get the user's initial message
+    • If any SKU has quantity==0  ➜ a2a_negotiate
+    • Else use the prior heuristic to decide between draft_plan or end
+    """
+    inventory = state.get("inventory_data", [])
+    if any(item.get("quantity", 0) == 0 for item in inventory):
+        return "a2a_negotiate"
+
+    messages = state.get("messages", [])
     user_message = next((m.content for m in messages if isinstance(m, HumanMessage)), "").lower()
 
-    # If the user intent is purely informational, end early.
-    # Otherwise, it's action-oriented (e.g. draft, plan, reallocate, optimize, etc.)
     informational_keywords = ["show", "list", "what", "how many", "level", "stock", "inventory"]
-    action_keywords = ["draft", "plan", "reallocate", "optimize", "move", "ship", "send", "update"]
+    action_keywords        = ["draft", "plan", "reallocate", "optimize", "move", "ship", "send", "update"]
 
-    # Simple heuristic: if it contains action words, route to draft_plan
-    # If it contains informational words and no action words, route to end
     has_action = any(word in user_message for word in action_keywords)
-    has_info = any(word in user_message for word in informational_keywords)
+    has_info   = any(word in user_message for word in informational_keywords)
 
     if has_action:
         return "draft_plan"
     elif has_info:
         return "end"
     else:
-        # Default to draft_plan if unclear but could be action
         return "draft_plan"
 
 # Router for HITL
@@ -175,18 +254,24 @@ builder.add_node("fetch_inventory", fetch_inventory)
 builder.add_node("draft_plan", draft_plan)
 builder.add_node("human_review", human_review)
 builder.add_node("execute_plan", execute_plan)
+builder.add_node("a2a_negotiate", a2a_negotiate)
+builder.add_node("draft_po", draft_po)
 
 builder.set_entry_point("global_oracle")
 builder.add_edge("global_oracle", "fetch_inventory")
 
 builder.add_conditional_edges(
-    "fetch_inventory",
-    route_intent,
-    {
-        "draft_plan": "draft_plan",
-        "end": END
-    }
+"fetch_inventory",
+route_intent,
+{
+"a2a_negotiate": "a2a_negotiate",
+"draft_plan": "draft_plan",
+"end": END
+}
 )
+
+builder.add_edge("a2a_negotiate", "draft_po")
+builder.add_edge("draft_po", "human_review")
 
 builder.add_edge("draft_plan", "human_review")
 
@@ -201,8 +286,24 @@ builder.add_conditional_edges(
 
 builder.add_edge("execute_plan", END)
 
-memory = MemorySaver()
-graph = builder.compile(
-    checkpointer=memory,
-    interrupt_before=["human_review"]
-)
+def get_graph():
+    return builder.compile(interrupt_before=["human_review"])
+
+def get_graph_with_postgres():
+    connection_kwargs = {
+        "autocommit": True,
+        "prepare_threshold": 0,
+    }
+
+    DB_URI = os.environ.get("POSTGRES_DB_URI", "postgresql://postgres:postgres@localhost:5432/postgres")
+    pool = ConnectionPool(conninfo=DB_URI, max_size=20, kwargs=connection_kwargs)
+    checkpointer = PostgresSaver(pool)
+    checkpointer.setup()
+
+    return builder.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["human_review"]
+    )
+
+if __name__ == "__main__":
+    graph = get_graph_with_postgres()
